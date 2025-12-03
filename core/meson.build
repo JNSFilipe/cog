@@ -1,3 +1,5 @@
+core_inc = include_directories('.')
+
 gamepad_manette = wpe_dep.version().version_compare('>= 1.13.90') and manette_dep.found()
 
 cog_config = configuration_data()
@@ -79,6 +81,8 @@ cogcore_dep = declare_dependency(
     dependencies: cogcore_dependencies,
     include_directories: include_directories('.'),
 )
+
+cogcore_lib_dep = cogcore_dep
 
 import('pkgconfig').generate(
     cogcore_lib,

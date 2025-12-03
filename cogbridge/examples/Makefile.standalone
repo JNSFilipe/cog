@@ -1,0 +1,44 @@
+# Standalone Makefile for CogBridge Examples
+# This Makefile allows building examples without the full meson build system
+# Assumes CogBridge and its dependencies are installed system-wide
+
+CC = gcc
+CFLAGS = -Wall -O2 $(shell pkg-config --cflags cogbridge wpe-webkit-1.0 json-glib-1.0)
+LDFLAGS = $(shell pkg-config --libs cogbridge wpe-webkit-1.0 json-glib-1.0)
+
+# If cogbridge is not installed, try local build
+ifeq ($(shell pkg-config --exists cogbridge && echo yes),)
+    CFLAGS = -Wall -O2 -I../../core -I.. $(shell pkg-config --cflags wpe-webkit-1.0 json-glib-1.0)
+    LDFLAGS = -L../../build/cogbridge -L../../build/core -lcogbridge -lcogcore $(shell pkg-config --libs wpe-webkit-1.0 json-glib-1.0)
+endif
+
+EXAMPLES = cogbridge-minimal cogbridge-dashboard
+
+.PHONY: all clean
+
+all: $(EXAMPLES)
+
+cogbridge-minimal: minimal.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+
+cogbridge-dashboard: embedded_dashboard.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+
+clean:
+	rm -f $(EXAMPLES)
+	@echo "Cleaned examples"
+
+help:
+	@echo "CogBridge Examples Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all      - Build all examples (default)"
+	@echo "  clean    - Remove built binaries"
+	@echo "  help     - Show this help"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make                    # Build all"
+	@echo "  make cogbridge-minimal  # Build specific example"
+	@echo "  make clean              # Clean up"

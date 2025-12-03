@@ -13,6 +13,7 @@
 #include <wpe/fdo.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 
 typedef struct {
     GSource         base;
@@ -182,6 +183,8 @@ drm_create_buffer_for_bo(CogDrmModesetRenderer *self,
     };
 
     in_modifiers[0] = gbm_bo_get_modifier(bo);
+    struct gbm_bo *scanout_bo = bo;
+    bool needs_shadow_buffer = false;
 
     int plane_count = MIN(gbm_bo_get_plane_count(bo), 4);
     for (int i = 0; i < plane_count; ++i) {
@@ -195,8 +198,77 @@ drm_create_buffer_for_bo(CogDrmModesetRenderer *self,
     uint32_t fb_id = 0;
 
     if (G_LIKELY(self->addfb2_modifiers)) {
+        g_debug("drm_create_buffer_for_bo: attempting drmModeAddFB2WithModifiers: w=%u h=%u fmt=0x%x planes=%d", 
+                width, height, format, plane_count);
+        for (int i = 0; i < plane_count; ++i) {
+            g_debug("  plane[%d]: handle=%u stride=%u offset=%u modifier=0x%llx",
+                    i, in_handles[i], in_strides[i], in_offsets[i], (unsigned long long)in_modifiers[i]);
+        }
         ret = drmModeAddFB2WithModifiers(get_drm_fd(self), width, height, format, in_handles, in_strides, in_offsets,
                                          in_modifiers, &fb_id, DRM_MODE_FB_MODIFIERS);
+        if (ret) {
+            g_debug("drmModeAddFB2WithModifiers failed: %s (errno=%d), modifier=0x%llx", 
+                    strerror(errno), errno, (unsigned long long)in_modifiers[0]);
+            
+            // Check if the buffer has a non-linear modifier that needs shadow buffer
+            if (in_modifiers[0] != DRM_FORMAT_MOD_LINEAR && in_modifiers[0] != DRM_FORMAT_MOD_INVALID) {
+                g_debug("Creating linear shadow buffer for tiled source (modifier 0x%llx)", 
+                        (unsigned long long)in_modifiers[0]);
+                needs_shadow_buffer = true;
+                
+                // Create a new linear GBM buffer for scanout
+                scanout_bo = gbm_bo_create(self->gbm_dev, width, height, format, 
+                                          GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR);
+                if (!scanout_bo) {
+                    g_warning("Failed to create linear shadow buffer");
+                    return NULL;
+                }
+                
+                // Copy data from tiled source to linear destination
+                uint32_t src_stride = 0, dst_stride = 0;
+                void *src_map_data = NULL, *dst_map_data = NULL;
+                void *src_ptr = NULL, *dst_ptr = NULL;
+                
+                src_ptr = gbm_bo_map(bo, 0, 0, width, height, GBM_BO_TRANSFER_READ, &src_stride, &src_map_data);
+                dst_ptr = gbm_bo_map(scanout_bo, 0, 0, width, height, GBM_BO_TRANSFER_WRITE, &dst_stride, &dst_map_data);
+                
+                if (src_ptr && dst_ptr) {
+                    // Copy line by line to handle different strides
+                    uint32_t bytes_per_pixel = 4; // Assuming ARGB8888
+                    uint32_t row_bytes = width * bytes_per_pixel;
+                    
+                    for (uint32_t y = 0; y < height; y++) {
+                        memcpy((uint8_t*)dst_ptr + y * dst_stride,
+                               (uint8_t*)src_ptr + y * src_stride,
+                               row_bytes);
+                    }
+                    g_debug("Copied %ux%u pixels from tiled to linear buffer", width, height);
+                } else {
+                    g_warning("Failed to map buffers for copy: src=%p dst=%p", src_ptr, dst_ptr);
+                }
+                
+                if (src_ptr) gbm_bo_unmap(bo, src_map_data);
+                if (dst_ptr) gbm_bo_unmap(scanout_bo, dst_map_data);
+                
+                // Update handles/strides for the linear buffer
+                in_handles[0] = gbm_bo_get_handle(scanout_bo).u32;
+                in_handles[1] = in_handles[2] = in_handles[3] = 0;
+                in_strides[0] = gbm_bo_get_stride(scanout_bo);
+                in_strides[1] = in_strides[2] = in_strides[3] = 0;
+                in_offsets[0] = in_offsets[1] = in_offsets[2] = in_offsets[3] = 0;
+            } else {
+                // Fall back to plain drmModeAddFB2 without modifiers for linear buffers
+                in_handles[0] = gbm_bo_get_handle(bo).u32;
+                in_handles[1] = in_handles[2] = in_handles[3] = 0;
+                in_strides[0] = gbm_bo_get_stride(bo);
+                in_strides[1] = in_strides[2] = in_strides[3] = 0;
+                in_offsets[0] = in_offsets[1] = in_offsets[2] = in_offsets[3] = 0;
+            }
+
+            g_debug("drm_create_buffer_for_bo: attempting drmModeAddFB2 (linear): w=%u h=%u fmt=0x%x handle=%u stride=%u",
+                    width, height, format, in_handles[0], in_strides[0]);
+            ret = drmModeAddFB2(get_drm_fd(self), width, height, format, in_handles, in_strides, in_offsets, &fb_id, 0);
+        }
     } else {
         in_handles[0] = gbm_bo_get_handle(bo).u32;
         in_handles[1] = in_handles[2] = in_handles[3] = 0;
@@ -204,11 +276,17 @@ drm_create_buffer_for_bo(CogDrmModesetRenderer *self,
         in_strides[1] = in_strides[2] = in_strides[3] = 0;
         in_offsets[0] = in_offsets[1] = in_offsets[2] = in_offsets[3] = 0;
 
+        g_debug("drm_create_buffer_for_bo: attempting drmModeAddFB2 (no modifiers capability): w=%u h=%u fmt=0x%x handle=%u stride=%u",
+                width, height, format, in_handles[0], in_strides[0]);
         ret = drmModeAddFB2(get_drm_fd(self), width, height, format, in_handles, in_strides, in_offsets, &fb_id, 0);
     }
 
     if (ret) {
-        g_warning("failed to create framebuffer: %s", strerror(errno));
+        g_warning("failed to create framebuffer: %s (errno=%d), w=%u h=%u fmt=0x%x handle=%u stride=%u modifier=0x%llx", 
+                  strerror(errno), errno, width, height, format, in_handles[0], in_strides[0], 
+                  (unsigned long long)in_modifiers[0]);
+        if (needs_shadow_buffer && scanout_bo != bo)
+            gbm_bo_destroy(scanout_bo);
         return NULL;
     }
 
@@ -219,8 +297,12 @@ drm_create_buffer_for_bo(CogDrmModesetRenderer *self,
     wl_resource_set_user_data(buffer_resource, self);
 
     buffer->fb_id = fb_id;
-    buffer->bo = bo;
+    buffer->bo = scanout_bo; // Use shadow buffer if created, otherwise original
     buffer->buffer_resource = buffer_resource;
+    
+    // If we created a shadow buffer, we need to keep the original bo reference too
+    // but for now we'll just use the scanout_bo for both cases
+    // TODO: might need to track both BOs if we need to update the shadow buffer later
 
     return buffer;
 }
@@ -260,10 +342,13 @@ drm_create_buffer_for_shm_buffer(CogDrmModesetRenderer *self,
     in_strides[0] = gbm_bo_get_stride(bo);
 
     uint32_t fb_id = 0;
+    g_debug("drm_create_buffer_for_shm_buffer: attempting drmModeAddFB2: w=%d h=%d fmt=0x%x handle=%u stride=%u",
+            width, height, gbm_format, in_handles[0], in_strides[0]);
     int ret = drmModeAddFB2(get_drm_fd(self), width, height, gbm_format, in_handles, in_strides, in_offsets, &fb_id, 0);
     if (ret) {
         gbm_bo_destroy(bo);
-        g_warning("failed to create framebuffer: %s", g_strerror(errno));
+        g_warning("failed to create framebuffer for SHM: %s (errno=%d), w=%d h=%d fmt=0x%x handle=%u stride=%u", 
+                  g_strerror(errno), errno, width, height, gbm_format, in_handles[0], in_strides[0]);
         return NULL;
     }
 

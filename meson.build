@@ -148,6 +148,7 @@ manette_dep = dependency('manette-0.2', version: '>=0.2.4', required: get_option
 
 subdir('core')
 subdir('platform')
+subdir('cogbridge')
 
 if get_option('documentation')
     subdir('docs')
